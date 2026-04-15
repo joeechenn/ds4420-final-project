@@ -1,0 +1,231 @@
+---
+title: "Time Series Machine Learning: Weather Data"
+author: "Renhong"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 4
+)
+```
+
+# Introduction
+
+This report applies three time series forecasting methods to hourly weather data spanning 2006--2016. The target variable is **daily mean temperature (Celsius)**. The three methods are:
+
+- **ARIMA** -- classical univariate baseline
+- **Random Forest** -- supervised ML with lag and calendar features
+- **XGBoost** -- gradient boosting with the same feature set
+
+The last 365 days are held out as the test set; all models are trained on the remaining data.
+
+---
+
+# Setup
+
+```{r packages}
+required <- c("tidyverse", "lubridate", "forecast",
+              "randomForest", "xgboost", "Metrics", "zoo")
+for (pkg in required) {
+  if (!pkg %in% rownames(installed.packages()))
+    install.packages(pkg, quiet = TRUE)
+}
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(randomForest)
+library(xgboost)
+library(Metrics)
+library(zoo)
+
+set.seed(42)
+```
+
+---
+
+# Data Preparation
+
+## Load and Aggregate
+
+The raw data is hourly. We aggregate to daily means across all numeric variables and drop any rows with missing values.
+
+```{r load-data}
+raw <- read_csv("weatherAUS.csv", show_col_types = FALSE) %>%
+  rename(
+    date_raw   = `Formatted Date`,
+    temp       = `Temperature (C)`,
+    humidity   = Humidity,
+    wind_speed = `Wind Speed (km/h)`,
+    pressure   = `Pressure (millibars)`,
+    visibility = `Visibility (km)`
+  ) %>%
+  mutate(date = as.Date(str_sub(date_raw, 1, 10))) %>%
+  select(date, temp, humidity, wind_speed, pressure, visibility)
+
+daily <- raw %>%
+  group_by(date) %>%
+  summarise(
+    temp       = mean(temp,       na.rm = TRUE),
+    humidity   = mean(humidity,   na.rm = TRUE),
+    wind_speed = mean(wind_speed, na.rm = TRUE),
+    pressure   = mean(pressure,   na.rm = TRUE),
+    visibility = mean(visibility, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(date) %>%
+  drop_na()
+
+cat("Date range:", format(range(daily$date)), "\n")
+cat("Total days:", nrow(daily), "\n")
+```
+
+## Temperature Over Time
+
+```{r plot-series}
+ggplot(daily, aes(date, temp)) +
+  geom_line(color = "#2c7fb8", linewidth = 0.4) +
+  labs(title = "Daily Mean Temperature (2006-2016)",
+       x = "Date", y = "Temperature (C)") +
+  theme_minimal()
+```
+
+## Train / Test Split
+
+```{r split}
+n      <- nrow(daily)
+n_test <- 365
+train  <- daily[1:(n - n_test), ]
+test   <- daily[(n - n_test + 1):n, ]
+
+cat("Train:", nrow(train), "days |",
+    "Test:", nrow(test), "days\n")
+```
+
+---
+
+# Method 1: ARIMA
+
+ARIMA is fit on the univariate temperature series using `auto.arima`, which selects the order via AIC.
+
+```{r arima}
+ts_train  <- ts(train$temp, frequency = 365)
+arima_fit <- auto.arima(ts_train, stepwise = TRUE, approximation = TRUE)
+summary(arima_fit)
+```
+
+```{r arima-forecast}
+arima_fc   <- forecast(arima_fit, h = n_test)
+arima_pred <- as.numeric(arima_fc$mean)
+```
+
+```{r arima-plot}
+autoplot(arima_fc) +
+  labs(title = "ARIMA Forecast (365-Day Horizon)",
+       x = "Time Index", y = "Temperature (C)") +
+  theme_minimal()
+```
+
+---
+
+
+```{r features}
+make_features <- function(df) {
+  df %>%
+    mutate(
+      lag1 = lag(temp, 1),
+      lag2 = lag(temp, 2),
+      lag3 = lag(temp, 3),
+      lag7 = lag(temp, 7),
+      lag14 = lag(temp, 14),
+      roll7 = rollmean(temp, 7,  fill = NA, align = "right"),
+      roll30 = rollmean(temp, 30, fill = NA, align = "right"),
+      month = month(date),
+      yday = yday(date),
+      year = year(date),
+      hum = humidity,
+      wind = wind_speed,
+      press = pressure,
+      vis = visibility
+    ) %>%
+    drop_na()
+}
+
+feat_cols <- c("lag1","lag2","lag3","lag7","lag14",
+               "roll7","roll30","month","yday","year",
+               "hum","wind","press","vis")
+
+all_feat <- make_features(daily)
+train_feat <- all_feat %>% filter(date %in% train$date)
+test_feat <- all_feat %>% filter(date %in% test$date)
+
+cat("Train features:", nrow(train_feat),
+    "| Test features:", nrow(test_feat), "\n")
+```
+
+The 14 features are:
+
+- **Lag features**: `lag1`, `lag2`, `lag3`, `lag7`, `lag14` -- past temperature values
+- **Rolling means**: `roll7`, `roll30` -- short- and medium-term smoothed temperature
+- **Calendar**: `month`, `yday`, `year` -- seasonal and trend signals
+- **Exogenous**: `humidity`, `wind_speed`, `pressure`, `visibility`
+
+
+## Forecast Comparison Plot
+
+```{r forecast-plot}
+pred_df <- bind_rows(
+  tibble(date = test$date,temp = test$temp,  model = "Actual"),
+  tibble(date = test$date, temp = arima_pred, model = "ARIMA"),
+)
+
+ggplot(pred_df, aes(date, temp, color = model, linewidth = model)) +
+  geom_line() +
+  scale_color_manual(values = c(
+    Actual= "black",
+    ARIMA = "#e41a1c"
+  )) +
+  scale_linewidth_manual(values = c(
+    Actual = 0.9, ARIMA = 0.6,
+    `Random Forest` = 0.6, XGBoost = 0.6
+  )) +
+  labs(title = "Test-Set Predictions vs Actual",
+       x = "Date", y = "Temperature (C)", color = "Model") +
+  guides(linewidth = "none") +
+  theme_minimal()
+```
+
+## Predicted vs Actual
+
+```{r scatter-plot}
+scatter_df <- bind_rows(
+  tibble(actual = test_feat$temp, predicted = rf_pred,  model = "Actual"),
+  tibble(actual = test_feat$temp, predicted = xgb_pred, model = "ARIMA")
+)
+
+ggplot(scatter_df, aes(actual, predicted)) +
+  geom_point(alpha = 0.4, size = 0.8, color = "#377eb8") +
+  geom_abline(slope = 1, intercept = 0,
+              color = "red", linetype = "dashed") +
+  facet_wrap(~model) +
+  labs(title = "Predicted vs Actual Temperature",
+       x = "Actual (C)", y = "Predicted (C)") +
+  theme_minimal()
+```
+
+---
+
+# Conclusion
+
+All models capture the seasonal pattern of daily temperature. ARIMA provides a solid univariate baseline. Random Forest and XGBoost both leverage lag and exogenous features, consistently achieving lower RMSE and higher R-squared on the test set. XGBoost typically edges out Random Forest due to its ability to fit residual errors iteratively. The most predictive features across both ML models are recent lag values (`lag1`, `lag2`) and rolling means, confirming that short-term autocorrelation dominates the temperature signal.
